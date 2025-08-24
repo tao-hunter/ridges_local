@@ -143,6 +143,7 @@ class LocalSandboxManager:
         
         # Start proxy container on the custom network, but configure it to reach the host's proxy service
         host_proxy_url = os.getenv('RIDGES_PROXY_URL', 'http://localhost:8001')
+        host_proxy_url = "http://localhost:8011"
         # Parse the URL and replace the hostname with host.docker.internal for Docker containers
         from urllib.parse import urlparse, urlunparse
         parsed = urlparse(host_proxy_url)
@@ -728,7 +729,13 @@ class LocalSandbox:
         # Capture container logs before removal
         try:
             if self.container:
-                logs = self.container.logs(stdout=True, stderr=True, tail=100).decode('utf-8', errors='ignore')
+                # logs = self.container.logs(stdout=True, stderr=True, tail=100).decode('utf-8', errors='ignore')
+                logs = self.container.logs(stdout=True, stderr=True).decode('utf-8', errors='ignore')
+                timestamp = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+                log_filename = f'container_logs/{timestamp}.txt'
+                with open(log_filename, 'w') as f:
+                    f.write(logs)
+                
                 self.container_logs = f"Container logs (last 100 lines):\n{logs}"
         except Exception as e:
             self.container_logs = f"Failed to capture container logs: {e}"

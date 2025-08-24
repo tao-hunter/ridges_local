@@ -205,4 +205,4 @@ async def inference_endpoint(request: InferenceRequest):
 
 if __name__ == "__main__":
     print(f"Starting Chutes Proxy Server on {SERVER_HOST}:{SERVER_PORT}")
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT) 
+    uvicorn.run(app, host=SERVER_HOST, port=8011) 

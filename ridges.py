@@ -554,13 +554,14 @@ def status():
 
 @cli.command()
 @click.option("--agent-file", default="miner/agent.py", help="Path to agent file to test")
-@click.option("--num-problems", default=3, type=int, help="Number of problems to test")
+@click.option("--num-problems", default=1, type=int, help="Number of problems to test")
 @click.option("--timeout", default=1200, type=int, help="Timeout per problem in seconds")
-@click.option("--problem-set", default="screener", type=click.Choice(['screener', 'easy', 'medium', 'hard']), help="Which problem set to use")
+@click.option("--problem-set", default="validator", type=click.Choice(['screener', 'easy', 'medium', 'hard', 'validator']), help="Which problem set to use")
 @click.option("--verbose", is_flag=True, help="Show detailed output")
 @click.option("--cleanup", is_flag=True, default=True, help="Clean up containers after test")
 @click.option("--start-proxy", is_flag=True, default=True, help="Automatically start proxy if needed")
-def test_agent(agent_file: str, num_problems: int, timeout: int, problem_set: str, verbose: bool, cleanup: bool, start_proxy: bool):
+@click.option("--problem-instance", default=None, help="Problem instance to test")
+def test_agent(agent_file: str, num_problems: int, timeout: int, problem_set: str, verbose: bool, cleanup: bool, start_proxy: bool, problem_instance: Optional[str]):
     """Test your agent locally with full SWE-bench evaluation"""
     
     import tempfile
@@ -665,6 +666,7 @@ def test_agent(agent_file: str, num_problems: int, timeout: int, problem_set: st
             agent_file=agent_file,
             num_problems=num_problems,
             timeout=timeout,
+            problem_instance=problem_instance,
             problem_set=problem_set,
             manager=local_manager
         ))
