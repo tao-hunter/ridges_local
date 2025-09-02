@@ -56,28 +56,39 @@ async def health_check():
 async def embedding_endpoint(request: EmbeddingRequest):
     """Proxy endpoint for chutes embedding with database validation"""
     try:
-        if ENV != 'dev' and request.run_id:
+        if ENV != 'dev':
+            # Production mode - run_id is required
+            if not request.run_id:
+                logger.warning(f"Embedding request attempted with None run_id in production mode")
+                raise HTTPException(status_code=400, detail="run_id is required in production mode")
+            
             # Get evaluation run from database
             evaluation_run = await get_evaluation_run_by_id(request.run_id)
             
             if not evaluation_run:
-                logger.warning(f"Embedding request for run_id {request.run_id} - evaluation run not found")
+                logger.warning(f"Embedding request for run_id {request.run_id} -- run_id not found")
                 raise HTTPException(status_code=404, detail="Evaluation run not found")
             
             # Check if evaluation run is in the correct state
             if evaluation_run.status != SandboxStatus.sandbox_created:
-                logger.warning(f"Embedding request for run_id {request.run_id} - invalid status: {evaluation_run.status}")
+                # logger.warning(f"Embedding request for run_id {request.run_id} -- status != sandbox_created: {evaluation_run.status}")
                 raise HTTPException(
                     status_code=400, 
                     detail=f"Evaluation run is not in the sandbox_created state. Current status: {evaluation_run.status}"
                 )
             
+            # Convert run_id to UUID (needed for database operations)
+            try:
+                run_uuid = UUID(request.run_id)
+            except ValueError:
+                # logger.warning(f"Embedding request with invalid UUID format: {request.run_id}")
+                raise HTTPException(status_code=400, detail="Invalid run_id format. Must be a valid UUID.")
+            
             if CHECK_COST_LIMITS:
                 # Check cost limits at FastAPI level
-                run_uuid = UUID(request.run_id)
                 current_cost = await get_total_embedding_cost(run_uuid)
                 if current_cost > MAX_COST_PER_RUN:
-                    logger.warning(f"Embedding request for run_id {request.run_id} exceeded cost limit: ${current_cost:.6f}")
+                    logger.warning(f"Embedding request for run_id {request.run_id} -- (current_cost = ${current_cost:.6f}) > (max cost = ${MAX_COST_PER_RUN})")
                     raise HTTPException(
                         status_code=429,
                         detail=f"Agent version has reached the maximum cost ({MAX_COST_PER_RUN}) for this evaluation run. Please do not request more embeddings."
@@ -86,17 +97,20 @@ async def embedding_endpoint(request: EmbeddingRequest):
             # Get embedding from chutes
             embedding_result = await chutes_client.embed(run_uuid, request.input)
         else:
-            # In dev mode or when run_id is None, skip all run_id operations
-            logger.info(f"Dev mode or no run_id: skipping run_id validation for embedding request")
+            # Dev mode - run_id is optional
+            # logger.info(f"Dev mode or no run_id: skipping run_id validation for embedding request")
             embedding_result = await chutes_client.embed(None, request.input)
         
-        logger.info(f"Embedding request completed successfully")
+        # logger.info(f"Embedding request completed successfully")
         return embedding_result
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing embedding request for run_id {request.run_id}: {e}")
+        # More detailed error logging for debugging
+        import traceback
+        logger.error(f"Embedding request for run_id {request.run_id} -- error: {traceback.format_exc()}")
+        
         raise HTTPException(
             status_code=500,
             detail="Failed to get embedding due to internal server error. Please try again later."
@@ -111,38 +125,49 @@ async def inference_endpoint(request: InferenceRequest):
     #     request.model = "deepseek-ai/DeepSeek-V3-0324"
 
     try:
+        # Don't log this stuff it provides no value
+
         # Log only the last incoming message to avoid flooding the console
-        if request.messages:
-            last_msg = request.messages[-1]
-            snippet = (last_msg.content[:300] + "…") if last_msg.content and len(last_msg.content) > 300 else last_msg.content
-            logger.info(
-                "Inference request | model=%s | run_id=%s | total_msgs=%d | last_role=%s | last_preview=%s",
-                request.model,
-                request.run_id,
-                len(request.messages),
-                last_msg.role,
-                snippet,
-            )
-        else:
-            logger.info(
-                "Inference request | model=%s | run_id=%s | total_msgs=0",
-                request.model,
-                request.run_id,
-            )
+        # if request.messages:
+        #     last_msg = request.messages[-1]
+        #     snippet = (last_msg.content[:300] + "…") if last_msg.content and len(last_msg.content) > 300 else last_msg.content
+        #     logger.info(
+        #         "Inference request | model=%s | run_id=%s | total_msgs=%d | last_role=%s | last_preview=%s",
+        #         request.model,
+        #         request.run_id,
+        #         len(request.messages),
+        #         last_msg.role,
+        #         snippet,
+        #     )
+        # else:
+        #     logger.info(
+        #         "Inference request | model=%s | run_id=%s | total_msgs=0",
+        #         request.model,
+        #         request.run_id,
+        #     )
         
-        if ENV != 'dev' and request.run_id:
-            logger.info(f"Taking production path with run_id validation")
+        if ENV != 'dev':
+            # Production mode - run_id is required
+            if not request.run_id:
+                logger.warning(f"Inference request attempted with None run_id in production mode")
+                raise HTTPException(status_code=400, detail="run_id is required in production mode")
+            
             # Get evaluation run from database
-            run_uuid = UUID(request.run_id)
+            try:
+                run_uuid = UUID(request.run_id)
+            except ValueError:
+                # logger.warning(f"Inference request with invalid UUID format: {request.run_id}")
+                raise HTTPException(status_code=400, detail="Invalid run_id format. Must be a valid UUID.")
+            
             evaluation_run = await get_evaluation_run_by_id(request.run_id)
             
             if not evaluation_run:
-                logger.warning(f"Inference request for run_id {request.run_id} - evaluation run not found")
+                logger.warning(f"Inference request for run_id {request.run_id} -- run_id not found")
                 raise HTTPException(status_code=404, detail="Evaluation run not found")
             
             # Check if evaluation run is in the correct state
             if evaluation_run.status != SandboxStatus.sandbox_created:
-                logger.warning(f"Inference request for run_id {request.run_id} - invalid status: {evaluation_run.status}")
+                # logger.warning(f"Inference request for run_id {request.run_id} -- status != sandbox_created: {evaluation_run.status}")
                 raise HTTPException(
                     status_code=400,
                     detail=f"Evaluation run is not in the sandbox_created state. Current status: {evaluation_run.status}"
@@ -151,7 +176,7 @@ async def inference_endpoint(request: InferenceRequest):
             # Check cost limits at FastAPI level
             current_cost = await get_total_inference_cost(run_uuid)
             if current_cost > MAX_COST_PER_RUN:
-                logger.warning(f"Inference request for run_id {request.run_id} exceeded cost limit: ${current_cost:.6f}")
+                logger.warning(f"Inference request for run_id {request.run_id} -- (current_cost = ${current_cost:.6f}) > (max cost = ${MAX_COST_PER_RUN})")
                 raise HTTPException(
                     status_code=429,
                     detail=f"Agent version has reached the maximum cost ({MAX_COST_PER_RUN}) for this evaluation run. Please do not request more inference."
@@ -167,8 +192,8 @@ async def inference_endpoint(request: InferenceRequest):
                 model=model
             )
         else:
-            # In dev mode or when run_id is None, skip all run_id operations
-            logger.info(f"Taking dev path - ENV: {ENV}, run_id: {request.run_id}")
+            # Dev mode - run_id is optional
+            # logger.info(f"Taking dev path - ENV: {ENV}, run_id: {request.run_id}")
             temperature = request.temperature if request.temperature is not None else DEFAULT_TEMPERATURE
             model = request.model if request.model is not None else DEFAULT_MODEL
             inference_result = await inference_manager.inference(
@@ -187,17 +212,20 @@ async def inference_endpoint(request: InferenceRequest):
         except Exception:
             resp_preview = "<non-string response>"
 
-        logger.info("Inference response preview (first 200 chars): %s", resp_preview)
+        # logger.info("Inference response preview (first 200 chars): %s", resp_preview)
 
-        logger.info("Inference request completed successfully")
+        #logger.info("Inference request completed successfully")
         
         return inference_result
         
     except HTTPException:
-        logger.error(f"HTTPException in inference endpoint")
+        # logger.error(f"HTTPException in inference endpoint")
         raise
     except Exception as e:
-        logger.error(f"Error processing inference request for run_id {request.run_id}: {e}")
+        # More detailed error logging for debugging
+        import traceback
+        logger.error(f"Inference request for run_id {request.run_id} -- error: {traceback.format_exc()}")
+        
         raise HTTPException(
             status_code=500,
             detail="Failed to get inference due to internal server error. Please try again later."

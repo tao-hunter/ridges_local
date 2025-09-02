@@ -20,6 +20,8 @@ from api.src.endpoints.agent_summaries import router as agent_summaries_router
 from api.src.endpoints.agents import router as agents_router
 from api.src.socket.server_helpers import fetch_and_store_commits
 from api.src.endpoints.open_users import router as open_user_router
+from api.src.endpoints.benchmarks import router as benchmarks_router
+from api.src.utils.slack import send_slack_message
 
 logger = get_logger(__name__)
 
@@ -34,6 +36,10 @@ async def lifespan(app: FastAPI):
     # Simple startup recovery through evaluation model
     from api.src.models.evaluation import Evaluation
     await Evaluation.startup_recovery()
+    
+    # Recover threshold-based approvals
+    from api.src.utils.threshold_scheduler import threshold_scheduler
+    await threshold_scheduler.recover_pending_approvals()
     
     asyncio.create_task(run_weight_setting_loop(30))
     yield
@@ -58,11 +64,14 @@ app.include_router(scoring_router, prefix="/scoring")
 app.include_router(agent_summaries_router, prefix="/agent-summaries")
 app.include_router(agents_router, prefix="/agents")
 app.include_router(open_user_router, prefix="/open-users")
+app.include_router(benchmarks_router, prefix="/benchmarks")
 app.include_router(healthcheck_router)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await WebSocketManager.get_instance().handle_connection(websocket)
 
+send_slack_message(f"From main.py")
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, ws_ping_timeout=None)
+    uvicorn.run(app, host="0.0.0.0", port=8000, ws_ping_timeout=None, ws_max_size=32 * 1024 * 1024)

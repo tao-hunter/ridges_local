@@ -7,8 +7,9 @@ from datetime import datetime
 import os
 from dotenv import load_dotenv
 
-from api.src.backend.queries.open_users import get_open_user, create_open_user, get_open_user_by_email, update_open_user_bittensor_hotkey as db_update_open_user_bittensor_hotkey, get_open_user_bittensor_hotkey as db_get_open_user_bittensor_hotkey, get_emission_dispersed_to_open_user as db_get_emission_dispersed_to_open_user, get_treasury_transactions_for_open_user as db_get_treasury_transactions_for_open_user, get_open_agent_periods_on_top as db_get_open_agent_periods_on_top
+from api.src.backend.queries.open_users import get_open_user, create_open_user, get_open_user_by_email, update_open_user_bittensor_hotkey as db_update_open_user_bittensor_hotkey, get_open_user_bittensor_hotkey as db_get_open_user_bittensor_hotkey, get_emission_dispersed_to_open_user as db_get_emission_dispersed_to_open_user, get_treasury_transactions_for_open_user as db_get_treasury_transactions_for_open_user, get_open_agent_periods_on_top as db_get_open_agent_periods_on_top, get_periods_on_top_map as db_get_periods_on_top_map, get_total_payouts_by_version_ids as db_get_total_payouts_by_version_ids
 from api.src.backend.queries.scores import get_treasury_hotkeys as db_get_treasury_hotkeys
+from api.src.backend.queries.agents import get_agent_by_version_id as db_get_agent_by_version_id
 from api.src.backend.entities import OpenUser, OpenUserSignInRequest
 from api.src.backend.internal_tools import InternalTools
 from loggers.logging_utils import get_logger
@@ -121,6 +122,45 @@ async def get_pending_emission_for_open_user(open_hotkey: str, password: str):
     except Exception as e:
         logger.error(f"Error getting pending emission for open user {open_hotkey}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error. Please try again later and message us on Discord if the problem persists.")
+    
+async def get_all_pending_payouts(password: str):
+    if password != open_user_password:
+        logger.warning(f"Someone tried to get all pending payouts with an invalid password. password: {password}")
+        raise HTTPException(status_code=401, detail="Invalid password. Fuck you.")
+    
+    try:
+        periods_on_top_map = await db_get_periods_on_top_map()
+        treasury_hotkeys = await db_get_treasury_hotkeys()
+        gross_emissions = await internal_tools.get_emission_alpha_map_for_hotkeys_during_periods(miner_hotkeys=treasury_hotkeys, periods_map=periods_on_top_map)
+        payouts = await db_get_total_payouts_by_version_ids(version_ids=list(gross_emissions.keys()))
+
+        hydrated_payouts = {}
+        for version_id in gross_emissions.keys():
+            agent = await db_get_agent_by_version_id(version_id)
+            agent_name = agent.agent_name if agent else None
+            agent_hotkey = agent.miner_hotkey if agent else None
+            bittensor_hotkey = await db_get_open_user_bittensor_hotkey(agent_hotkey) if agent_hotkey else None
+            periods = periods_on_top_map.get(version_id, [])
+            periods_on_top = [(str(start), str(end)) for start, end in periods]
+
+            realized = payouts.get(version_id, 0)
+            gross = gross_emissions.get(version_id, 0)
+            pending = gross - realized
+
+            hydrated_payouts[version_id] = {
+                "pending_payout": pending,
+                "realized_payout": realized,
+                "gross_payout": gross,
+                "agent_name": agent_name,
+                "agent_hotkey": agent_hotkey,
+                "periods_on_top": periods_on_top,
+                "bittensor_hotkey": bittensor_hotkey,
+            }
+
+        return {"success": True, "pending_payouts": hydrated_payouts}
+    except Exception as e:
+        logger.error(f"Error getting all pending payouts: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error. Please try again later and message us on Discord if the problem persists.")
 
 router = APIRouter()
 
@@ -130,6 +170,7 @@ routes = [
     ("/update-bittensor-hotkey", update_bittensor_hotkey, ["POST"]),
     ("/get-treasury-transactions-for-open-user", get_treasury_transactions_for_open_user, ["GET"]),
     ("/get-pending-emission-for-open-user", get_pending_emission_for_open_user, ["GET"]),
+    ("/get-all-pending-payouts", get_all_pending_payouts, ["GET"]),
 ]
 
 for path, endpoint, methods in routes:

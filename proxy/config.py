@@ -24,6 +24,7 @@ MODEL_PRICING: Dict[str, float] = {
     "chutesai/Llama-4-Maverick-17B-128E-Instruct-FP8": 0.2722,
     "Qwen/Qwen3-32B": 0.0272,
     "Qwen/Qwen3-235B-A22B-Instruct-2507": 0.0000,
+    "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8": 0.1999,
     "Qwen/QwQ-32B": 0.0151,
     "chutesai/Mistral-Small-3.2-24B-Instruct-2506": 0.0302,
     "unsloth/gemma-3-27b-it": 0.1568,
@@ -48,12 +49,22 @@ MODEL_PRICING: Dict[str, float] = {
 
 # Models that support Targon fallback
 TARGON_FALLBACK_MODELS = {
-    "moonshotai/Kimi-K2-Instruct"
+    "moonshotai/Kimi-K2-Instruct",
+    "zai-org/GLM-4.5-FP8",  # Will be redirected to GLM-4.5
+    "Qwen/Qwen3-235B-A22B-Instruct-2507"
 }
 
 # Targon-specific pricing (per million tokens)
 TARGON_PRICING: Dict[str, float] = {
-    "moonshotai/Kimi-K2-Instruct": 0.14,  # $0.14/M input, $2.49/M output - using input rate for now
+    "moonshotai/Kimi-K2-Instruct": 0.14,
+    "zai-org/GLM-4.5-FP8": 0.5,  # Same pricing as FP8 variant
+    "Qwen/Qwen3-235B-A22B-Instruct-2507": 0.12
+      # $0.14/M input, $2.49/M output - using input rate for now
+}
+
+# Model redirects (map requested model to actual model for Targon)
+MODEL_REDIRECTS: Dict[str, str] = {
+    "zai-org/GLM-4.5-FP8": "zai-org/GLM-4.5"  # Redirect FP8 to standard GLM-4.5
 }
 
 # Cost limits

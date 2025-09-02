@@ -15,6 +15,7 @@ from api.src.backend.queries.agents import check_if_agent_banned
 from api.src.backend.entities import MinerAgent, Evaluation
 from api.src.utils.s3 import S3Manager
 from api.src.utils.similarity_checker import SimilarityChecker
+from api.src.backend.db_manager import get_transaction
 
 logger = get_logger(__name__)
 s3_manager = S3Manager()
@@ -114,7 +115,7 @@ async def check_hotkey_registered(miner_hotkey: str) -> None:
 async def check_file_size(agent_file: UploadFile) -> str:
     logger.debug(f"Checking if the file size is valid...")
 
-    MAX_FILE_SIZE = 1 * 1024 * 1024 
+    MAX_FILE_SIZE = 2 * 1024 * 1024 
     file_size = 0
     content = b""
     for chunk in agent_file.file:
@@ -200,4 +201,21 @@ async def upload_agent_code_to_s3(version_id: str, agent_file: UploadFile) -> No
         )
     
     logger.debug(f"Successfully uploaded agent code for version {version_id} to S3.")
-    
+
+async def record_upload_attempt(upload_type: str, success: bool, **kwargs) -> None:
+    """Record an upload attempt in the upload_attempts table."""
+    try:
+        async with get_transaction() as conn:
+            await conn.execute(
+                """INSERT INTO upload_attempts (upload_type, success, hotkey, agent_name, filename, 
+                file_size_bytes, ip_address, error_type, error_message, ban_reason, http_status_code, version_id) 
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)""",
+                upload_type, success, kwargs.get('hotkey'), kwargs.get('agent_name'), kwargs.get('filename'),
+                kwargs.get('file_size_bytes'), kwargs.get('ip_address'), kwargs.get('error_type'),
+                kwargs.get('error_message'), kwargs.get('ban_reason'), kwargs.get('http_status_code'), kwargs.get('version_id')
+            )
+        logger.debug(f"Recorded upload attempt: type={upload_type}, success={success}, error_type={kwargs.get('error_type')}")
+    except Exception as e:
+        logger.error(f"Failed to record upload attempt: {e}")
+
+

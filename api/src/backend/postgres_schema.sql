@@ -1,3 +1,18 @@
+-- Threshold configuration table
+CREATE TABLE IF NOT EXISTS threshold_config (
+    key TEXT PRIMARY KEY NOT NULL,
+    value DOUBLE PRECISION NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Insert default threshold configuration values
+INSERT INTO threshold_config (key, value) VALUES 
+('innovation_weight', 0.25),
+('decay_per_epoch', 0.05),
+('frontier_scale', 0.84),
+('improvement_weight', 0.30)
+ON CONFLICT (key) DO NOTHING;
+
 -- Agent Versions table
 CREATE TABLE IF NOT EXISTS miner_agents (
     version_id UUID PRIMARY KEY NOT NULL,
@@ -98,6 +113,12 @@ CREATE TABLE IF NOT EXISTS inferences (
     status_code INT
 );
 
+-- Performance optimization indices for inferences queries
+CREATE INDEX IF NOT EXISTS idx_inferences_created_provider_range
+ON inferences (created_at, provider)
+INCLUDE (finished_at, status_code, total_tokens)
+WHERE finished_at IS NOT NULL AND provider IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS approved_version_ids (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     version_id UUID REFERENCES miner_agents(version_id),
@@ -117,7 +138,8 @@ CREATE TABLE IF NOT EXISTS open_users (
     auth0_user_id TEXT NOT NULL,
     email TEXT NOT NULL,
     name TEXT NOT NULL,
-    registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    admin INT NOT NULL DEFAULT 7
 );
 
 
@@ -241,6 +263,11 @@ WHERE status != 'cancelled';
 CREATE INDEX IF NOT EXISTS idx_evaluation_runs_evaluation_id 
 ON evaluation_runs (evaluation_id);
 
+-- Optimized index for innovation score calculations
+CREATE INDEX IF NOT EXISTS idx_evaluation_runs_innovation_fast
+ON evaluation_runs (swebench_instance_id, started_at, solved, run_id)
+WHERE status = 'result_scored' AND solved = true;
+
 -- Speeds up filtering to the miner’s version_ids
 CREATE INDEX IF NOT EXISTS idx_miner_agents_miner_hotkey_version
 ON miner_agents (miner_hotkey, version_id);
@@ -280,9 +307,9 @@ agent_evaluations AS (
         e.set_id,
         e.score,
         e.validator_hotkey,
-        (avi.version_id IS NOT NULL) as approved
+        (avi.version_id IS NOT NULL AND avi.approved_at <= NOW()) as approved,
+        avi.approved_at
     FROM all_agents aa
-    LEFT JOIN approved_version_ids avi ON aa.version_id = avi.version_id
     INNER JOIN evaluations e ON aa.version_id = e.version_id
         AND e.status = 'completed' 
         AND e.score IS NOT NULL
@@ -291,6 +318,7 @@ agent_evaluations AS (
         AND e.validator_hotkey NOT LIKE 'screener-2-%'
         AND e.validator_hotkey NOT LIKE 'i-0%'
         AND e.set_id IS NOT NULL
+    LEFT JOIN approved_version_ids avi ON aa.version_id = avi.version_id AND e.set_id = avi.set_id
 ),
 filtered_scores AS (
     -- Remove the lowest score for each agent version and set combination
@@ -312,13 +340,14 @@ SELECT
     fs.agent_summary,
     fs.set_id,
     fs.approved,
+    fs.approved_at,
     COUNT(DISTINCT fs.validator_hotkey) AS validator_count,
     AVG(fs.score) AS final_score
 FROM filtered_scores fs
 WHERE fs.set_id IS NOT NULL
     AND fs.score_rank > 1  -- Exclude the lowest score (rank 1)
 GROUP BY fs.version_id, fs.miner_hotkey, fs.agent_name, fs.version_num, 
-         fs.created_at, fs.status, fs.agent_summary, fs.set_id, fs.approved
+         fs.created_at, fs.status, fs.agent_summary, fs.set_id, fs.approved, fs.approved_at
 HAVING COUNT(DISTINCT fs.validator_hotkey) >= 2  -- At least 2 validators
 ORDER BY final_score DESC, created_at ASC;
 
@@ -456,7 +485,7 @@ BEGIN
     FROM agent_scores a
     WHERE a.set_id = latest_set_id
       AND a.version_id IN (
-          SELECT version_id FROM approved_version_ids WHERE set_id = latest_set_id
+          SELECT version_id FROM approved_version_ids WHERE set_id = latest_set_id AND approved_at <= NOW()
       )
     ORDER BY a.final_score DESC, a.created_at ASC
     LIMIT 1;
@@ -503,3 +532,21 @@ CREATE TRIGGER tr_set_approved_top_agent_on_eval_insert
     AFTER INSERT ON evaluations
     FOR EACH ROW
     EXECUTE FUNCTION set_approved_top_agent_if_changed();
+
+-- Upload Attempts table to track all upload attempts
+CREATE TABLE IF NOT EXISTS upload_attempts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    upload_type TEXT NOT NULL, -- 'agent' or 'open-agent'
+    hotkey TEXT,
+    agent_name TEXT,
+    filename TEXT,
+    file_size_bytes BIGINT,
+    ip_address TEXT,
+    success BOOLEAN NOT NULL,
+    error_type TEXT,
+    error_message TEXT,
+    ban_reason TEXT,
+    http_status_code INT,
+    version_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

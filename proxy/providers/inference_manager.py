@@ -33,6 +33,10 @@ class InferenceManager:
     
     def _find_provider(self, model: str) -> InferenceProvider:
         """Find the primary provider for the given model"""
+        # Prioritize Targon for models it supports (avoid unnecessary Chutes attempts)
+        # if self.targon.supports_model(model) and self.targon.is_available():
+        #     return self.targon
+            
         for provider in self.providers:
             if provider.supports_model(model) and provider.is_available():
                 return provider
@@ -73,7 +77,7 @@ class InferenceManager:
         try:
             primary_provider = self._find_provider(model)
         except ValueError as e:
-            logger.warning(f"Unsupported model requested for run {run_id}: {model}")
+            # logger.warning(f"Unsupported model requested for run {run_id}: {model}")
             return {"error": str(e)}
         
         # Convert messages to dict format for database storage
@@ -89,8 +93,12 @@ class InferenceManager:
             inference_id = await create_inference(run_id, messages_dict, temperature, model, primary_provider.name)
 
         # Try primary provider first
-        logger.debug(f"Trying {primary_provider.name} for model {model}")
-        response_text, status_code = await primary_provider.inference(run_id, messages, temperature, model)
+        # logger.debug(f"Trying {primary_provider.name} for model {model}")
+        try:
+            response_text, status_code = await primary_provider.inference(run_id, messages, temperature, model)
+        except Exception as e:
+            logger.error(f"{primary_provider.name} inference failed for run {run_id} (model: {model}): {type(e).__name__}: {e}")
+            raise
         
         # Calculate cost and tokens
         if status_code == 200:
@@ -115,7 +123,7 @@ class InferenceManager:
         # Try fallback provider if available
         fallback_provider = self._get_fallback_provider(model, primary_provider)
         if fallback_provider:
-            logger.info(f"Attempting {fallback_provider.name} fallback for model {model} after {primary_provider.name} failure")
+            # logger.info(f"Attempting {fallback_provider.name} fallback for model {model} after {primary_provider.name} failure")
             
             # Create separate inference record for fallback attempt (skip in dev mode)
             fallback_inference_id = None

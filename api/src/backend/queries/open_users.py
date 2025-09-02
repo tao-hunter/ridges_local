@@ -95,72 +95,53 @@ async def get_open_user_bittensor_hotkey(conn: asyncpg.Connection, open_hotkey: 
 async def get_open_agent_periods_on_top(conn: asyncpg.Connection, miner_hotkey: str) -> list[tuple[datetime, datetime]]:
     rows = await conn.fetch(
         """
-        WITH top_intervals AS (
+        WITH ordered AS (
             SELECT
-                ta.version_id,
-                ta.created_at AS span_start,
-                LEAD(ta.created_at) OVER (ORDER BY ta.created_at, ta.id) AS span_end
-            FROM top_agents ta
-        ),
-        events_top AS (
-            SELECT
-                ti.version_id,
-                ti.span_start AS event_time
-            FROM top_intervals ti
-            JOIN approved_version_ids avi
-                ON avi.version_id = ti.version_id
-               AND avi.approved_at <= ti.span_start
-        ),
-        events_approval AS (
-            SELECT
-                ti.version_id,
-                avi.approved_at AS event_time
-            FROM top_intervals ti
-            JOIN approved_version_ids avi
-                ON avi.version_id = ti.version_id
-               AND avi.approved_at > ti.span_start
-               AND avi.approved_at < COALESCE(ti.span_end, NOW())
-        ),
-        events AS (
-            SELECT DISTINCT version_id, event_time FROM (
-                SELECT * FROM events_top
-                UNION ALL
-                SELECT * FROM events_approval
-            ) x
-        ),
-        ordered AS (
-            SELECT
-                version_id,
-                event_time,
-                LAG(version_id) OVER (ORDER BY event_time) AS prev_version_id
-            FROM events
-        ),
-        change_points AS (
-            SELECT version_id, event_time
-            FROM ordered
-            WHERE prev_version_id IS DISTINCT FROM version_id OR prev_version_id IS NULL
-        ),
-        spans AS (
-            SELECT
-                version_id,
-                event_time AS top_start_at,
-                LEAD(event_time) OVER (ORDER BY event_time) AS top_end_at
-            FROM change_points
+                ath.version_id,
+                ath.top_at AS period_start,
+                LEAD(ath.top_at) OVER (ORDER BY ath.top_at) AS period_end
+            FROM approved_top_agents_history ath
         )
         SELECT
-            s.top_start_at AS period_start,
-            COALESCE(s.top_end_at, NOW()) AS period_end
-        FROM spans s
-        JOIN miner_agents ma ON ma.version_id = s.version_id
-        JOIN approved_version_ids avi ON avi.version_id = s.version_id
+            o.period_start,
+            COALESCE(o.period_end, NOW()) AS period_end
+        FROM ordered o
+        JOIN miner_agents ma ON ma.version_id = o.version_id
         WHERE ma.miner_hotkey = $1
-          AND s.top_start_at >= avi.approved_at
-        ORDER BY period_start ASC
+        ORDER BY o.period_start ASC
         """,
         miner_hotkey,
     )
 
     return [(row["period_start"], row["period_end"]) for row in rows]
+
+@db_operation
+async def get_periods_on_top_map(conn: asyncpg.Connection) -> dict[str, list[tuple[datetime, datetime]]]:
+    rows = await conn.fetch(
+        """
+        WITH ordered AS (
+            SELECT
+                ath.version_id,
+                ath.top_at AS period_start,
+                LEAD(ath.top_at) OVER (ORDER BY ath.top_at) AS period_end
+            FROM approved_top_agents_history ath
+            WHERE ath.version_id IS NOT NULL
+        )
+        SELECT
+            o.version_id,
+            o.period_start,
+            COALESCE(o.period_end, NOW()) AS period_end
+        FROM ordered o
+        ORDER BY o.period_start ASC
+        """,
+    )
+
+    periods_map: dict[str, list[tuple[datetime, datetime]]] = {}
+    for row in rows:
+        version_id = str(row["version_id"])
+        periods_map.setdefault(version_id, []).append((row["period_start"], row["period_end"]))
+
+    return periods_map
 
 @db_operation
 async def get_emission_dispersed_to_open_user(conn: asyncpg.Connection, open_hotkey: str) -> int:
@@ -270,3 +251,32 @@ async def get_all_treasury_hotkeys(conn: asyncpg.Connection) -> list[dict]:
         }
         for row in rows
     ]
+
+@db_operation
+async def get_total_dispersed_by_treasury_hotkeys(conn: asyncpg.Connection) -> int:
+    total = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount_alpha_rao), 0)
+        FROM treasury_transactions
+        """,
+    )
+
+    return int(total) if total is not None else 0
+
+@db_operation
+async def get_total_payouts_by_version_ids(conn: asyncpg.Connection, version_ids: list[str]) -> dict[str, int]:
+    if not version_ids:
+        return {}
+
+    rows = await conn.fetch(
+        """
+        SELECT version_id, COALESCE(SUM(amount_alpha_rao), 0) AS total_amount
+        FROM treasury_transactions
+        WHERE version_id = ANY($1::uuid[])
+        GROUP BY version_id
+        """,
+        version_ids,
+    )
+
+    totals = {str(row["version_id"]): int(row["total_amount"]) for row in rows}
+    return {vid: totals.get(vid, 0) for vid in version_ids}

@@ -18,12 +18,13 @@ from api.src.backend.queries.statistics import get_24_hour_statistics, get_curre
 from api.src.backend.queries.statistics import get_top_agents as db_get_top_agents, get_queue_position_by_hotkey, QueuePositionPerValidator, get_inference_details_for_run
 from api.src.backend.queries.statistics import get_agent_scores_over_time as db_get_agent_scores_over_time, get_miner_score_activity as db_get_miner_score_activity
 from api.src.backend.queries.queue import get_queue_for_all_validators as db_get_queue_for_all_validators, get_screener_queue_by_stage as db_get_screener_queue_by_stage
-from api.src.backend.queries.evaluation_sets import get_evaluation_set_instances, get_latest_set_id
+from api.src.backend.queries.evaluation_sets import get_latest_set_id
 from api.src.backend.entities import ProviderStatistics
 from api.src.backend.queries.inference import get_inference_provider_statistics as db_get_inference_provider_statistics
 from api.src.backend.internal_tools import InternalTools
 from api.src.backend.queries.open_users import get_emission_dispersed_to_open_user as db_get_emission_dispersed_to_open_user, get_all_transactions as db_get_all_transactions, get_all_treasury_hotkeys as db_get_all_treasury_hotkeys
 from api.src.backend.queries.agents import get_all_approved_version_ids as db_get_all_approved_version_ids
+from api.src.backend.queries.open_users import get_total_dispersed_by_treasury_hotkeys as db_get_total_dispersed_by_treasury_hotkeys
 from api.src.utils.config import AGENT_RATE_LIMIT_SECONDS
 
 load_dotenv()
@@ -419,6 +420,23 @@ async def get_all_treasury_hotkeys() -> list[dict]:
             status_code=500,
             detail="Internal server error while retrieving all treasury hotkeys"
         )
+    
+async def get_pending_dispersal() -> dict[str, Any]:
+    """
+    Returns all pending dispersal from treasury hotkeys
+    """
+    try:
+        treasury_hotkeys = await db_get_all_treasury_hotkeys()
+        total_emission_received = await internal_tools.get_emission_alpha_for_hotkeys(miner_hotkeys=[hotkey["hotkey"] for hotkey in treasury_hotkeys])
+        total_disperesed = await db_get_total_dispersed_by_treasury_hotkeys()
+        pending_dispersal = total_emission_received - total_disperesed
+        return {"pending_dispersal": pending_dispersal}
+    except Exception as e:
+        logger.error(f"Error retrieving pending dispersal: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error while retrieving pending dispersal"
+        )
 
 router = APIRouter()
 
@@ -448,7 +466,8 @@ routes = [
     ("/approved-version-ids", get_approved_version_ids),
     ("/time-until-next-upload-for-hotkey", get_time_until_next_upload_for_hotkey),
     ("/all-transactions", get_all_transactions),
-    ("/all-treasury-hotkeys", get_all_treasury_hotkeys)
+    ("/all-treasury-hotkeys", get_all_treasury_hotkeys),
+    ("/pending-dispersal", get_pending_dispersal)
 ]
 
 for path, endpoint in routes:

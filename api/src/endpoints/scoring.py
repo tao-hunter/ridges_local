@@ -10,7 +10,6 @@ from api.src.utils.config import PRUNE_THRESHOLD, SCREENING_1_THRESHOLD, SCREENI
 from api.src.models.evaluation import Evaluation
 from api.src.models.validator import Validator
 from api.src.utils.auth import verify_request
-from api.src.utils.models import TopAgentHotkey
 from loggers.logging_utils import get_logger
 from api.src.backend.queries.agents import get_top_agent, ban_agents as db_ban_agents, approve_agent_version
 from api.src.backend.entities import MinerAgent, MinerAgentScored
@@ -22,6 +21,9 @@ from api.src.utils.slack import notify_unregistered_top_miner, notify_unregister
 from api.src.backend.internal_tools import InternalTools
 from api.src.backend.entities import TreasuryTransaction
 from api.src.backend.queries.scores import store_treasury_transaction as db_store_treasury_transaction
+from api.src.backend.queries.scores import generate_threshold_function as db_generate_threshold_function
+from api.src.backend.queries.scores import evaluate_agent_for_threshold_approval
+from api.src.utils.threshold_scheduler import threshold_scheduler
 
 load_dotenv()
 
@@ -84,7 +86,7 @@ async def weights() -> Dict[str, float]:
         approved_agent_hotkeys_data = await conn.fetch("""
             SELECT DISTINCT miner_hotkey FROM approved_version_ids
             LEFT JOIN miner_agents ma on ma.version_id = approved_version_ids.version_id
-            WHERE ma.miner_hotkey NOT LIKE 'open-%'
+            WHERE ma.miner_hotkey NOT LIKE 'open-%' AND approved_version_ids.approved_at <= NOW()
         """)
         approved_agent_hotkeys = [row["miner_hotkey"] for row in approved_agent_hotkeys_data]
 
@@ -144,7 +146,13 @@ async def trigger_weight_set():
     return {"message": "Successfully triggered weight update"}
 
 async def approve_version(version_id: str, set_id: int, approval_password: str):
-    """Approve a version ID for weight consideration"""
+    """Approve a version ID using threshold scoring logic
+    
+    Args:
+        version_id: The agent version to evaluate for approval
+        set_id: The evaluation set ID  
+        approval_password: Password for approval
+    """
     if approval_password != os.getenv("APPROVAL_PASSWORD"):
         raise HTTPException(status_code=401, detail="Invalid approval password. Fucker.")
     
@@ -153,11 +161,51 @@ async def approve_version(version_id: str, set_id: int, approval_password: str):
         raise HTTPException(status_code=404, detail="Agent not found")
     
     try:
-        await approve_agent_version(version_id, set_id)
-        return {"message": f"Successfully approved {version_id} for set {set_id}"}
+        # Use threshold scoring logic to determine approval action
+        result = await evaluate_agent_for_threshold_approval(version_id, set_id)
+        
+        if result['action'] == 'approve_now':
+            # Approve immediately and add to top agents history
+            await approve_agent_version(version_id, set_id, None)
+            
+            async with get_transaction() as conn:
+                await conn.execute("""
+                    INSERT INTO approved_top_agents_history (version_id, set_id, top_at)
+                    VALUES ($1, $2, NOW())
+                """, version_id, set_id)
+            
+            return {
+                "message": f"Agent {version_id} approved immediately - {result['reason']}",
+                "action": "approve_now"
+            }
+            
+        elif result['action'] == 'approve_future':
+            # Schedule future approval
+            threshold_scheduler.schedule_future_approval(
+                version_id, 
+                set_id, 
+                result['future_approval_time']
+            )
+            
+            # Store the future approval in approved_version_ids with future timestamp
+            await approve_agent_version(version_id, set_id, result['future_approval_time'])
+            
+            return {
+                "message": f"Agent {version_id} scheduled for approval at {result['future_approval_time'].isoformat()} - {result['reason']}",
+                "action": "approve_future",
+                "approval_time": result['future_approval_time'].isoformat()
+            }
+            
+        else:  # reject
+            return {
+                "message": f"Agent {version_id} not approved - {result['reason']}",
+                "action": "reject"
+            }
+            
     except Exception as e:
-        logger.error(f"Error approving version {version_id} for set {set_id}: {e}")
+        logger.error(f"Error evaluating agent {version_id} for threshold approval: {e}")
         raise HTTPException(status_code=500, detail="Failed to approve version due to internal server error. Please try again later.")
+
 
 async def re_eval_approved(approval_password: str):
     """
@@ -182,7 +230,7 @@ async def re_eval_approved(approval_password: str):
             # Reset approved agents to awaiting stage 1 screening
             agent_data = await conn.fetch("""
                 UPDATE miner_agents SET status = 'awaiting_screening_1'
-                WHERE version_id IN (SELECT version_id FROM approved_version_ids)
+                WHERE version_id IN (SELECT version_id FROM approved_version_ids WHERE approved_at <= NOW())
                                           AND status != 'replaced'
                 AND miner_hotkey NOT IN (SELECT miner_hotkey FROM banned_hotkeys)
                 RETURNING *
@@ -308,6 +356,53 @@ async def store_treasury_transaction(dispersion_extrinsic_code: str, version_id:
     except Exception as e:
         logger.error(f"Error storing treasury transaction: {e}")
         raise HTTPException(status_code=500, detail="Error storing treasury transaction")
+    
+async def get_threshold_function():
+    """
+    Returns the threshold function with additional metadata
+    """
+    try:
+        return await db_generate_threshold_function()
+    except Exception as e:
+        logger.error(f"Error generating threshold function: {e}")
+        raise HTTPException(status_code=500, detail="Error generating threshold function. Please try again later.")
+
+
+async def prune_agent(version_ids: str, approval_password: str):
+    """Prune a specific agent by setting its status to pruned and pruning all its evaluations, a comma separated list of version_ids"""
+    if approval_password != os.getenv("APPROVAL_PASSWORD"):
+        raise HTTPException(status_code=401, detail="Invalid approval password")
+    
+    try:
+        for version_id in version_ids.split(","):
+            async with get_transaction() as conn:
+                # Check if agent exists
+                agent = await conn.fetchrow("SELECT * FROM miner_agents WHERE version_id = $1", version_id)
+                if not agent:
+                    raise HTTPException(status_code=404, detail="Agent not found")
+                
+                # Update agent status to pruned
+                await conn.execute("UPDATE miner_agents SET status = 'pruned' WHERE version_id = $1", version_id)
+                
+                # Update all evaluations for this agent to pruned status
+                evaluation_count = await conn.fetchval("""
+                    UPDATE evaluations 
+                    SET status = 'pruned', finished_at = NOW() 
+                    WHERE version_id = $1 
+                    AND status IN ('waiting', 'running', 'error', 'completed')
+                    AND validator_hotkey NOT LIKE 'screener-%'
+                    RETURNING (SELECT COUNT(*) FROM evaluations WHERE version_id = $1)
+                """, version_id)
+                
+                logger.info(f"Pruned agent {version_id} ({agent['agent_name']}) and {evaluation_count or 0} evaluations")
+                
+        return {"message": f"Successfully pruned {len(version_ids.split(','))} agents"}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error pruning agent {version_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to prune agent due to internal server error")
 
 router = APIRouter()
 
@@ -323,7 +418,9 @@ routes = [
     ("/refresh-scores", refresh_scores, ["POST"]),
     ("/re-evaluate-agent", re_evaluate_agent, ["POST"]),
     ("/re-run-evaluation", re_run_evaluation, ["POST"]),
-    ("/store-treasury-transaction", store_treasury_transaction, ["POST"])
+    ("/store-treasury-transaction", store_treasury_transaction, ["POST"]),
+    ("/threshold-function", get_threshold_function, ["GET"]),
+    ("/prune-agent", prune_agent, ["POST"])
 ]
 
 for path, endpoint, methods in routes:

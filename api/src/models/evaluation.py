@@ -12,6 +12,7 @@ from api.src.models.screener import Screener
 from api.src.models.validator import Validator
 from api.src.utils.config import SCREENING_1_THRESHOLD, SCREENING_2_THRESHOLD
 from api.src.utils.config import PRUNE_THRESHOLD
+from api.src.utils.slack import send_slack_message
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +144,10 @@ class Evaluation:
                             break
                 elif stage == 2:
                     # Stage 2 passed -> check if we should prune immediately
-                    combined_screener_score = await Screener.get_combined_screener_score(conn, self.version_id)
+                    combined_screener_score, score_error = await Screener.get_combined_screener_score(conn, self.version_id)
+                    # ^ if this is None, we should likely not be here, because it means that either there was no screener 1 or screener 2 evaluation, but in which case how would be here anyway?
+                    if score_error:
+                        await send_slack_message(f"Stage 2 screener score error for version {self.version_id}: {score_error}")
                     top_agent = await MinerAgentScored.get_top_agent(conn)
                     
                     if top_agent and combined_screener_score is not None and (top_agent.avg_score - combined_screener_score) > PRUNE_THRESHOLD:
@@ -161,6 +165,9 @@ class Evaluation:
                     # Create evaluation records but don't notify yet
                     validators_to_notify = await Validator.get_connected()
                     for validator in validators_to_notify:
+                        if (combined_screener_score is None):
+                            await send_slack_message(f"111 Screener score is None when creating evaluation for validator {validator.hotkey}, version {self.version_id}")
+                            await send_slack_message(f"Evaluation object: {str(self)}")
                         await self.create_for_validator(conn, self.version_id, validator.hotkey, combined_screener_score)
                     
                     # Prune low-scoring evaluations after creating validator evaluations
@@ -253,22 +260,22 @@ class Evaluation:
                 await conn.execute("UPDATE miner_agents SET status = 'awaiting_screening_2' WHERE version_id = $1", self.version_id)
             return
 
-        # Check for any stage 1 screening evaluations (waiting OR running)
+        # Check for any stage 1 screening evaluations (only running - waiting evaluations don't mean agent is actively being screened)
         stage1_count = await conn.fetchval(
             """SELECT COUNT(*) FROM evaluations WHERE version_id = $1 
                AND (validator_hotkey LIKE 'screener-1-%' OR validator_hotkey LIKE 'i-0%') 
-               AND status IN ('waiting', 'running')""",
+               AND status = 'running'""",
             self.version_id,
         )
         if stage1_count > 0:
             await conn.execute("UPDATE miner_agents SET status = 'screening_1' WHERE version_id = $1", self.version_id)
             return
 
-        # Check for any stage 2 screening evaluations (waiting OR running)
+        # Check for any stage 2 screening evaluations (only running - waiting evaluations don't mean agent is actively being screened)
         stage2_count = await conn.fetchval(
             """SELECT COUNT(*) FROM evaluations WHERE version_id = $1 
                AND validator_hotkey LIKE 'screener-2-%' 
-               AND status IN ('waiting', 'running')""",
+               AND status = 'running'""",
             self.version_id,
         )
         if stage2_count > 0:
@@ -303,9 +310,68 @@ class Evaluation:
         if waiting_count > 0 and running_count == 0:
             await conn.execute("UPDATE miner_agents SET status = 'waiting' WHERE version_id = $1", self.version_id)
         elif waiting_count == 0 and running_count == 0 and completed_count > 0:
+            # Calculate and update innovation score for this agent before setting status to 'scored'
+            await self._update_innovation_score(conn)
             await conn.execute("UPDATE miner_agents SET status = 'scored' WHERE version_id = $1", self.version_id)
         else:
             await conn.execute("UPDATE miner_agents SET status = 'evaluating' WHERE version_id = $1", self.version_id)
+
+    async def _update_innovation_score(self, conn: asyncpg.Connection):
+        """Calculate and update innovation score for this evaluation's agent in one atomic query"""
+        try:
+            # Single atomic query that calculates and updates innovation score
+            updated_rows = await conn.execute("""
+                WITH agent_runs AS (
+                    -- Get all result_scored runs for this agent
+                    SELECT
+                        r.swebench_instance_id,
+                        r.solved,
+                        r.started_at,
+                        r.run_id
+                    FROM evaluation_runs r
+                    JOIN evaluations e ON e.evaluation_id = r.evaluation_id
+                    WHERE e.version_id = $1
+                      AND r.status = 'result_scored'
+                ),
+                runs_with_prior AS (
+                    -- Calculate prior solved ratio for each run using window functions
+                    SELECT
+                        swebench_instance_id,
+                        solved,
+                        started_at,
+                        run_id,
+                        -- Calculate average solve rate for this instance before this run
+                        COALESCE(
+                            AVG(CASE WHEN solved THEN 1.0 ELSE 0.0 END) 
+                            OVER (
+                                PARTITION BY swebench_instance_id 
+                                ORDER BY started_at 
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                            ), 0.0
+                        ) AS prior_solved_ratio
+                    FROM agent_runs
+                ),
+                innovation_calculation AS (
+                    SELECT
+                        COALESCE(
+                            AVG((CASE WHEN solved THEN 1.0 ELSE 0.0 END) - prior_solved_ratio), 0.0
+                        ) AS innovation_score
+                    FROM runs_with_prior
+                )
+                UPDATE miner_agents 
+                SET innovation = (SELECT innovation_score FROM innovation_calculation)
+                WHERE version_id = $1
+            """, self.version_id)
+            
+            logger.info(f"Updated innovation score for agent {self.version_id} (affected {updated_rows} rows)")
+            
+        except Exception as e:
+            logger.error(f"Failed to calculate innovation score for agent {self.version_id}: {e}")
+            # Set innovation score to NULL on error to indicate calculation failure
+            await conn.execute(
+                "UPDATE miner_agents SET innovation = NULL WHERE version_id = $1",
+                self.version_id
+            )
 
     @staticmethod
     def get_lock():
@@ -319,8 +385,18 @@ class Evaluation:
             raise AssertionError("Evaluation lock must be held for this operation")
 
     @staticmethod
-    async def create_for_validator(conn: asyncpg.Connection, version_id: str, validator_hotkey: str, screener_score: Optional[float] = None) -> str:
+    async def create_for_validator(conn: asyncpg.Connection, version_id: str, validator_hotkey: str, screener_score: Optional[float] = None) -> Optional[str]:
         """Create evaluation for validator"""
+
+        # We should always have a screener score when creating an evaluation for a validator
+        if screener_score is None:
+            combined_screener_score, score_error = await Screener.get_combined_screener_score(conn, version_id)
+            await send_slack_message(f"333 Screener score is None when creating evaluation for validator {validator_hotkey}, version {version_id}")
+            if score_error:
+                await send_slack_message(f"Error calculating screener score: {score_error}")
+            else:
+                await send_slack_message(f"If the combined screener score was calculated right now, it would be {combined_screener_score}")
+
         set_id = await conn.fetchval("SELECT MAX(set_id) from evaluation_sets")
 
         # Check if evaluation already exists for this combination
@@ -336,28 +412,49 @@ class Evaluation:
 
         if existing_eval_id:
             logger.debug(f"Evaluation already exists for version {version_id}, validator {validator_hotkey}, set {set_id}")
+            if screener_score is None:
+                await send_slack_message(f"444 Screener score is None when creating evaluation for validator {validator_hotkey}, version {version_id}, and the evaluation already exists {existing_eval_id}")
             return str(existing_eval_id)
 
-        # Create new evaluation
-        eval_id = str(uuid.uuid4())
-        await conn.execute(
-            """
-            INSERT INTO evaluations (evaluation_id, version_id, validator_hotkey, set_id, status, created_at, screener_score)
-            VALUES ($1, $2, $3, $4, 'waiting', NOW(), $5)
-        """,
-            eval_id,
-            version_id,
-            validator_hotkey,
-            set_id,
-            screener_score,
-        )
 
-        return eval_id
+        if screener_score is None:
+            await send_slack_message(f"555 Screener score is None when creating evaluation for validator {validator_hotkey}, version {version_id}. AS SUCH, DID NOT CREATE THE EVALUATION!")
+            await send_slack_message("========================================================")
+            return None
+        else:
+            # Create new evaluation
+            eval_id = str(uuid.uuid4())
+            await conn.execute(
+                """
+                INSERT INTO evaluations (evaluation_id, version_id, validator_hotkey, set_id, status, created_at, screener_score)
+                VALUES ($1, $2, $3, $4, 'waiting', NOW(), $5)
+            """,
+                eval_id,
+                version_id,
+                validator_hotkey,
+                set_id,
+                screener_score,
+            )
+            return eval_id
 
     @staticmethod
     async def create_screening_and_send(conn: asyncpg.Connection, agent: 'MinerAgent', screener: 'Screener') -> Tuple[str, bool]:
         """Create screening evaluation"""
         from api.src.socket.websocket_manager import WebSocketManager
+
+        # Safety check: Ensure screener doesn't already have a running evaluation
+        existing_evaluation = await conn.fetchrow(
+            """
+            SELECT evaluation_id, status FROM evaluations 
+            WHERE validator_hotkey = $1 AND status = 'running'
+            LIMIT 1
+            """,
+            screener.hotkey
+        )
+        
+        if existing_evaluation:
+            logger.error(f"CRITICAL: Screener {screener.hotkey} already has running evaluation {existing_evaluation['evaluation_id']} - refusing to create duplicate screening")
+            return "", False
 
         ws = WebSocketManager.get_instance()
 
@@ -578,7 +675,7 @@ class Evaluation:
             # Create evaluations for waiting/evaluating agents that don't have one for this validator
             agents = await conn.fetch(
                 """
-                SELECT version_id FROM miner_agents 
+                SELECT * FROM miner_agents 
                 WHERE status IN ('waiting', 'evaluating') 
                 AND NOT EXISTS (
                     SELECT 1 FROM evaluations 
@@ -592,7 +689,12 @@ class Evaluation:
             )
 
             for agent in agents:
-                combined_screener_score = await Screener.get_combined_screener_score(conn, agent["version_id"])
+                combined_screener_score, score_error = await Screener.get_combined_screener_score(conn, agent["version_id"])
+                if (combined_screener_score is None):
+                    await send_slack_message(f"222 Agent object: {dict(agent)}")
+                    await send_slack_message(f"222 Screener score is None when creating evaluation for validator {validator.hotkey}, version {agent['version_id']}")
+                    if score_error:
+                        await send_slack_message(f"222 Error: {score_error}")
                 await Evaluation.create_for_validator(conn, agent["version_id"], validator.hotkey, combined_screener_score)
 
         async with get_transaction() as conn:
@@ -639,7 +741,7 @@ class Evaluation:
             for screening_row in active_screenings:
                 evaluation = await Evaluation.get_by_id(screening_row["evaluation_id"])
                 if evaluation:
-                    await evaluation.error(conn, "Disconnected from screener")
+                    await evaluation.error(conn, "Disconnected from screener (error code 1)")
 
     @staticmethod
     async def startup_recovery():
@@ -660,7 +762,7 @@ class Evaluation:
                 evaluation = await Evaluation.get_by_id(eval_row["evaluation_id"])
                 if evaluation:
                     if evaluation.is_screening:
-                        await evaluation.error(conn, "Disconnected from screener")
+                        await evaluation.error(conn, "Disconnected from screener (error code 2)")
                     else:
                         await evaluation.reset_to_waiting(conn)
 
@@ -696,7 +798,7 @@ class Evaluation:
             for screening_row in waiting_screenings:
                 evaluation = await Evaluation.get_by_id(screening_row["evaluation_id"])
                 if evaluation:
-                    await evaluation.error(conn, "Disconnected from screener")
+                    await evaluation.error(conn, "Disconnected from screener (error code 3)")
 
             # Cancel dangling evaluation runs
             await conn.execute(

@@ -374,6 +374,22 @@ async def get_running_evaluation_by_validator_hotkey(conn: asyncpg.Connection, v
     return Evaluation(**dict(result)) 
 
 @db_operation
+async def does_validator_have_running_evaluation(
+    conn: asyncpg.Connection, 
+    validator_hotkey: str
+) -> bool:
+    return await conn.fetchval(
+        """
+        SELECT EXISTS(
+            SELECT 1
+            FROM evaluations
+            WHERE (status = 'running' AND validator_hotkey = $1)
+        );
+        """,
+        validator_hotkey
+    )
+
+@db_operation
 async def get_running_evaluation_by_miner_hotkey(conn: asyncpg.Connection, miner_hotkey: str) -> Optional[Evaluation]:
     result = await conn.fetchrow(
         """
@@ -408,3 +424,21 @@ async def get_queue_info(conn: asyncpg.Connection, validator_hotkey: str, length
     )
 
     return [Evaluation(**dict(row)) for row in result]
+
+@db_operation
+async def get_agent_name_from_version_id(conn: asyncpg.Connection, version_id: str) -> Optional[str]:
+    """Get agent name for a given version_id"""
+    return await conn.fetchval("""
+        SELECT agent_name 
+        FROM miner_agents 
+        WHERE version_id = $1
+    """, version_id)
+
+@db_operation
+async def get_miner_hotkey_from_version_id(conn: asyncpg.Connection, version_id: str) -> Optional[str]:
+    """Get miner hotkey for a given version_id"""
+    return await conn.fetchval("""
+        SELECT miner_hotkey 
+        FROM miner_agents 
+        WHERE version_id = $1
+    """, version_id)
