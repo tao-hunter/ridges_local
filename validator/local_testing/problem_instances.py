@@ -116,6 +116,19 @@ VALIDATOR_EASY_INSTANCES = [
     "pytest-dev__pytest-7432",
     "django__django-11820",
     "pytest-dev__pytest-5262",
+    "django__django-15127",
+    "django__django-11066",
+    "django__django-14376",
+    "django__django-11964",
+    "django__django-15368",
+    "django__django-15315",
+    "django__django-14493",
+    "django__django-13551",
+    "django__django-14765",
+    "django__django-15930",
+    "django__django-15741",
+    "astropy__astropy-14309",
+    "django__django-15277"
 ]
 
 VALIDATOR_MEDIUM_INSTANCES = [
@@ -138,7 +151,30 @@ VALIDATOR_MEDIUM_INSTANCES = [
     "sympy__sympy-13798",
     "django__django-15252",
     "django__django-12273",
-    "sympy__sympy-20438"
+    "sympy__sympy-20438",
+    "django__django-11333",
+    "sympy__sympy-23950",
+    "sympy__sympy-13974",
+    "sympy__sympy-19783",
+    "sympy__sympy-13031",
+    "django__django-12050",
+    "sphinx-doc__sphinx-7748",
+    "django__django-13670",
+    "sphinx-doc__sphinx-8265",
+    "sphinx-doc__sphinx-9658",
+    "django__django-15563",
+    "django__django-13786",
+    "django__django-11815",
+    "django__django-16662",
+    "sympy__sympy-18211",
+    "django__django-7530",
+    "django__django-11211",
+    "django__django-14434",
+    "django__django-15561",
+    "django__django-15916",
+    "pylint-dev__pylint-7277",
+    "django__django-16116",
+    ""
 ]
 
 VALIDATOR_HARD_INSTANCES = [
@@ -151,5 +187,21 @@ VALIDATOR_HARD_INSTANCES = [
     "sympy__sympy-12489",
     "sympy__sympy-17630",
     "sympy__sympy-16597",
-    "sympy__sympy-18199"
+    "sympy__sympy-18199",
+    "django__django-13212",
+    "sphinx-doc__sphinx-8548",
+    "django__django-16631",
+    "django__django-14007",
+    "django__django-13449",
+    "sphinx-doc__sphinx-9461",
+    "scikit-learn__scikit-learn-25102",
+    "django__django-16560",
+    "astropy__astropy-13398",
+    "django__django-11138",
+    "django__django-12708",
+    "django__django-15629",
+    "django__django-14631",
+    "django__django-15268",
+    "pytest-dev__pytest-6197",
+    
 ]

@@ -9,12 +9,13 @@ This module orchestrates:
 
 import asyncio
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from pathlib import Path
 import json
+import random
 
 from swebench.harness.run_evaluation import load_swebench_dataset
-from validator.local_testing.problem_instances import EASY_INSTANCES, MEDIUM_INSTANCES, HARD_INSTANCES, SCREENER_INSTANCES, TEST_SCREENER_INSTANCES
+from validator.local_testing.problem_instances import EASY_INSTANCES, MEDIUM_INSTANCES, HARD_INSTANCES, SCREENER_INSTANCES, TEST_SCREENER_INSTANCES, VALIDATOR_EASY_INSTANCES, VALIDATOR_MEDIUM_INSTANCES, VALIDATOR_HARD_INSTANCES
 from validator.sandbox.schema import SwebenchProblem
 from validator.local_testing.local_manager import LocalSandboxManager
 from loggers.logging_utils import get_logger
@@ -168,6 +169,7 @@ async def run_local_evaluations(
     num_problems: int,
     timeout: int,
     problem_set: str,
+    problem_instance: Optional[str],
     manager: LocalSandboxManager
 ) -> Dict[str, Any]:
     """Run local evaluations on selected problems in parallel"""
@@ -179,7 +181,7 @@ async def run_local_evaluations(
     
     # Load problems
     console.print("Loading problem set...", style="cyan")
-    problems = load_local_problems(problem_set, num_problems)
+    problems = load_local_problems(problem_set, num_problems, problem_instance)
     total_tests = len(problems)
     
     console.print(f"Selected {len(problems)} problems from {problem_set} set", style="green")
@@ -293,7 +295,7 @@ async def run_single_evaluation(sandbox, problem: SwebenchProblem) -> Dict[str, 
             'patch_content': '',  # Add empty patch content for errors
         }
 
-def load_local_problems(problem_set: str, num_problems: int) -> List[SwebenchProblem]:
+def load_local_problems(problem_set: str, num_problems: int, problem_instance: Optional[str]) -> List[SwebenchProblem]:
     """Load problems for local testing"""
     
     # Select problem instances
@@ -307,11 +309,17 @@ def load_local_problems(problem_set: str, num_problems: int) -> List[SwebenchPro
         instances = HARD_INSTANCES
     elif problem_set == "all":
         instances = EASY_INSTANCES + MEDIUM_INSTANCES + HARD_INSTANCES
+    elif problem_set == "validator":
+        instances = VALIDATOR_EASY_INSTANCES + VALIDATOR_MEDIUM_INSTANCES + VALIDATOR_HARD_INSTANCES
     else:
         instances = TEST_SCREENER_INSTANCES  # Default fallback
     
-    # Take only the requested number
-    selected_instances = instances[:num_problems]
+    if problem_instance:
+        selected_instances = [problem_instance]
+    else:
+        # Take only the requested number
+        # selected_instances = random.sample(instances, min(num_problems, len(instances)))
+        selected_instances = instances[:num_problems]
     
     # Load from SWE-bench dataset
     swebench_problems = load_swebench_dataset(
