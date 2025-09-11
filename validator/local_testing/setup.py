@@ -125,7 +125,6 @@ def setup_local_testing_environment():
     # Show configuration being used
     api_url = os.getenv("RIDGES_API_URL", "http://localhost:8000")
     proxy_url = os.getenv("RIDGES_PROXY_URL", "http://localhost:8001")
-    proxy_url = "http://localhost:8011"
     console.print(f"Using API URL: {api_url}", style="cyan")
     console.print(f"Using Proxy URL: {proxy_url}", style="cyan")
     

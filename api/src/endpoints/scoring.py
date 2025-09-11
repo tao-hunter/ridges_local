@@ -9,7 +9,7 @@ import uuid
 from api.src.utils.config import PRUNE_THRESHOLD, SCREENING_1_THRESHOLD, SCREENING_2_THRESHOLD
 from api.src.models.evaluation import Evaluation
 from api.src.models.validator import Validator
-from api.src.utils.auth import verify_request
+from api.src.utils.auth import verify_request, verify_request_public
 from loggers.logging_utils import get_logger
 from api.src.backend.queries.agents import get_top_agent, ban_agents as db_ban_agents, approve_agent_version
 from api.src.backend.entities import MinerAgent, MinerAgentScored
@@ -43,7 +43,7 @@ async def tell_validators_to_set_weights():
 async def run_weight_setting_loop(minutes: int):
     while True:
         await tell_validators_to_set_weights()
-        await asyncio.sleep(minutes * 60)
+        await asyncio.sleep(minutes * 20)
 
 ## Actual endpoints ##
 
@@ -82,38 +82,30 @@ async def weights() -> Dict[str, float]:
     """
     DUST_WEIGHT = 1/65535 # 1/(2^16 - 1), smallest weight possible
 
-    async with get_db_connection() as conn:
-        approved_agent_hotkeys_data = await conn.fetch("""
-            SELECT DISTINCT miner_hotkey FROM approved_version_ids
-            LEFT JOIN miner_agents ma on ma.version_id = approved_version_ids.version_id
-            WHERE ma.miner_hotkey NOT LIKE 'open-%' AND approved_version_ids.approved_at <= NOW()
-        """)
-        approved_agent_hotkeys = [row["miner_hotkey"] for row in approved_agent_hotkeys_data]
+    treasury_hotkey = await get_treasury_hotkey()
 
-        treasury_hotkeys_data = await conn.fetch("""
-            SELECT hotkey FROM treasury_wallets WHERE active = TRUE
-        """)
-        treasury_hotkeys = [row["hotkey"] for row in treasury_hotkeys_data]
-
-        dust_hotkeys = approved_agent_hotkeys + treasury_hotkeys
-
-    weights = {hotkey: DUST_WEIGHT for hotkey in dust_hotkeys} 
+    weights = {
+        treasury_hotkey: DUST_WEIGHT
+    }
 
     top_agent = await get_top_agent()
 
+    # Disburse to treasury to manually send to whoever should be top agent in the event of an error
     if top_agent is None:
+        weights[treasury_hotkey] = 1.0
+
         return weights
 
-    weight_left = 1.0 - DUST_WEIGHT * len(approved_agent_hotkeys)
+    weight_left = 1.0 - DUST_WEIGHT
     if top_agent.miner_hotkey.startswith("open-"):
-        weights[await get_treasury_hotkey()] = weight_left
+        weights[treasury_hotkey] = weight_left
     else:
         if check_if_hotkey_is_registered(top_agent.miner_hotkey):
             weights[top_agent.miner_hotkey] = weight_left
         else:
             logger.error(f"Top agent {top_agent.miner_hotkey} not registered on subnet")
             await notify_unregistered_top_miner(top_agent.miner_hotkey)
-            weights[await get_treasury_hotkey()] = weight_left
+            weights[treasury_hotkey] = 1.0
 
     return weights
 
@@ -264,26 +256,35 @@ async def refresh_scores():
         logger.error(f"Error refreshing agent scores: {e}")
         raise HTTPException(status_code=500, detail="Error refreshing agent scores")
 
-async def re_evaluate_agent(password: str, version_id: str):
+async def re_evaluate_agent(password: str, version_id: str, re_eval_screeners_and_validators: bool = False):
     """Re-evaluate an agent by resetting all validator evaluations for a version_id back to waiting status"""
     if password != os.getenv("APPROVAL_PASSWORD"):
         raise HTTPException(status_code=401, detail="Invalid password")
 
     try:
         async with get_transaction() as conn:
-            validator_evaluations = await conn.fetch("""
-                SELECT * FROM evaluations WHERE version_id = $1
-                    AND validator_hotkey NOT LIKE 'screener-%'
-                    AND validator_hotkey NOT LIKE 'i-0%'
-            """, version_id)
+            # Build query conditionally based on re_eval_screeners_and_validators parameter
+            if re_eval_screeners_and_validators:
+                # Include all evaluations (screeners and validators)
+                query = "SELECT * FROM evaluations WHERE version_id = $1"
+                validator_evaluations = await conn.fetch(query, version_id)
+            else:
+                # Exclude screener and validator evaluations (original behavior)
+                query = """
+                    SELECT * FROM evaluations WHERE version_id = $1
+                        AND validator_hotkey NOT LIKE 'screener-%'
+                        AND validator_hotkey NOT LIKE 'i-0%'
+                """
+                validator_evaluations = await conn.fetch(query, version_id)
             
             for evaluation_data in validator_evaluations:
                 evaluation = Evaluation(**evaluation_data)
                 await evaluation.reset_to_waiting(conn)
             
-            logger.info(f"Reset {len(validator_evaluations)} validator evaluations for version {version_id}")
+            evaluation_type = "all" if re_eval_screeners_and_validators else "validator"
+            logger.info(f"Reset {len(validator_evaluations)} {evaluation_type} evaluations for version {version_id}")
             return {
-                "message": f"Successfully reset {len(validator_evaluations)} validator evaluations for version {version_id}",
+                "message": f"Successfully reset {len(validator_evaluations)} {evaluation_type} evaluations for version {version_id}",
             }
             
     except Exception as e:
@@ -404,26 +405,76 @@ async def prune_agent(version_ids: str, approval_password: str):
         logger.error(f"Error pruning agent {version_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to prune agent due to internal server error")
 
+async def check_evaluation_status(evaluation_id: str):
+    """Check if an evaluation has been cancelled or is still active"""
+    
+    try:
+        async with get_db_connection() as conn:
+            # Check evaluation status
+            result = await conn.fetchrow(
+                "SELECT status, finished_at FROM evaluations WHERE evaluation_id = $1", 
+                uuid.UUID(evaluation_id)
+            )
+            
+            if not result:
+                raise HTTPException(status_code=404, detail="Evaluation not found")
+            
+            status = result['status']
+            finished_at = result['finished_at']
+            
+            # If evaluation is cancelled, replaced, pruned, or error, it should be stopped
+            should_stop = status in ['cancelled', 'replaced', 'pruned', 'error']
+            
+            return {
+                "evaluation_id": evaluation_id,
+                "status": status,
+                "should_stop": should_stop,
+                "finished_at": finished_at.isoformat() if finished_at else None
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error checking evaluation status {evaluation_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to check evaluation status")
+
 router = APIRouter()
 
-routes = [
+# Public scoring endpoints (read-only data)
+public_routes = [
     ("/check-top-agent", weight_receiving_agent, ["GET"]),
     ("/weights", weights, ["GET"]),
     ("/screener-thresholds", get_screener_thresholds, ["GET"]),
     ("/prune-threshold", get_prune_threshold, ["GET"]),
-    ("/ban-agents", ban_agents, ["POST"]),
-    ("/approve-version", approve_version, ["POST"]),
+    ("/threshold-function", get_threshold_function, ["GET"]),
     ("/trigger-weight-update", trigger_weight_set, ["POST"]),
-    ("/re-eval-approved", re_eval_approved, ["POST"]),
-    ("/refresh-scores", refresh_scores, ["POST"]),
+    ("/check-evaluation-status", check_evaluation_status, ["GET"]),
     ("/re-evaluate-agent", re_evaluate_agent, ["POST"]),
     ("/re-run-evaluation", re_run_evaluation, ["POST"]),
-    ("/store-treasury-transaction", store_treasury_transaction, ["POST"]),
-    ("/threshold-function", get_threshold_function, ["GET"]),
+    ("/approve-version", approve_version, ["POST"]),
     ("/prune-agent", prune_agent, ["POST"])
 ]
 
-for path, endpoint, methods in routes:
+# Protected scoring endpoints (admin functions)
+protected_routes = [
+    ("/ban-agents", ban_agents, ["POST"]),
+    ("/re-eval-approved", re_eval_approved, ["POST"]),
+    ("/refresh-scores", refresh_scores, ["POST"]),
+    ("/store-treasury-transaction", store_treasury_transaction, ["POST"])
+]
+
+# Add public routes
+for path, endpoint, methods in public_routes:
+    router.add_api_route(
+        path,
+        endpoint,
+        tags=["scoring"],
+        dependencies=[Depends(verify_request_public)],
+        methods=methods
+    )
+
+# Add protected routes
+for path, endpoint, methods in protected_routes:
     router.add_api_route(
         path,
         endpoint,
